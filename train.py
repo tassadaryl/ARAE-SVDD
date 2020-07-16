@@ -44,10 +44,26 @@ def train_autoencoder(models, optimizers, source, target, params):
 
     return {'ae_loss': ae_loss.numpy(), 'acc': accuracy.numpy()}
 
+def train_SVDD(autoencoder, optimizer, dataset, c, params, args):
+    batch_epoch = params.batch_epoch
+    step, batch = 0, 0
+    for e in range(0, params.max_epoch):
+        for batch, (source, target) in enumerate(dataset):
+            
+            with tf.GradientTape() as tape:
+                output = autoencoder(source, encode_only=True, noise=False)
+                dist_loss = tf.reduce_mean((output - c) ** 2)
+            
+            gradients = tape.gradient(dist_loss, autoencoder.trainable_variables)
+            gradients, _ = tf.clip_by_global_norm(gradients, params.clip)
+            optimizer.apply_gradients(zip(gradients, autoencoder.trainable_variables))
+            if step % 5 == 0:
+                print("svdd loss: {}, step={}".format(dist_loss, step))
+            step += 1
+
 
 def train(models, optimizers, dataset, corpus, ckpts, params, args):
     epoch_num = params.epoch_num
-    # epoch_gan = params.epoch_gan
     batch_epoch = params.batch_epoch
     autoencoder.noise_radius = params.noise_radius
     step = 0
@@ -90,6 +106,9 @@ def train(models, optimizers, dataset, corpus, ckpts, params, args):
 
         batch_epoch = 0
 
+def init_center_c(models, dataset, eps=0.1):
+    return
+
 
 if __name__ == '__main__':
     # Load the parameters from the experiment params.json file in model_dir
@@ -108,7 +127,7 @@ if __name__ == '__main__':
     logging.info('Preparing dataset...')
     corpus = Corpus(args.data_dir, n_tokens=args.vocab_size)
     args.vocab_size = min(args.vocab_size, corpus.vocab_size)
-    dataset = tf.data.Dataset.from_tensor_slices((corpus.train_source, corpus.train_target)).batch(params.batch_size)
+    dataset = tf.data.Dataset.from_tensor_slices((corpus.train_source, corpus.train_target)).batch(params.batch_size, drop_remainder=True)
 
     # Models
     autoencoder = Seq2Seq(params, args)
@@ -133,6 +152,24 @@ if __name__ == '__main__':
 
     logging.info('Training...')
     train(models, optimizers, dataset, corpus, ckpts, params, args)
+
+    ######################################################################
+    ###         following are DeepSVDD part
+    ######################################################################
+
+    logging.info('Initializing c ...')
+    batch_latent_mean = []
+    for batch, (source, target) in enumerate(dataset):
+        real_latent = autoencoder(source, encode_only=True, noise=False)
+        batch_latent_mean.append(tf.reduce_mean(real_latent, axis = 0))
+    
+    c = tf.reduce_mean(tf.cast(batch_latent_mean, tf.float32), axis = 0)
+    svdd_optim = tf.keras.optimizers.Adam(amsgrad = True)
+    
+    logging.info('Training SVDD...')
+
+    train_SVDD(autoencoder, svdd_optim, dataset, c, params, args)
+
 
 
 
