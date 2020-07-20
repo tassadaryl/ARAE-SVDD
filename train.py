@@ -1,6 +1,7 @@
 import os
 import logging
 import tensorflow as tf
+import numpy as np
 from itertools import islice
 
 from models.autoencoder import Seq2Seq
@@ -8,6 +9,7 @@ from opts import configure_args
 from build_vocab import Corpus
 from utils import Params, Metrics, Checkpoints, set_logger, static_vars, set_seeds
 from tensorboardX import SummaryWriter
+from sklearn.metrics import roc_auc_score
 
 
 def loss_func(targets, logits):
@@ -45,9 +47,14 @@ def train_autoencoder(models, optimizers, source, target, params):
     return {'ae_loss': ae_loss.numpy(), 'acc': accuracy.numpy()}
 
 def train_SVDD(autoencoder, optimizer, dataset, c, params, args):
-    batch_epoch = params.batch_epoch
-    step, batch = 0, 0
-    for e in range(0, params.max_epoch):
+    batch = 0
+    #learning scheduler
+    boundaries = [20, 30]
+    values = [0.0001, 0.00001, 0.000001]
+
+    for e in range(0, 40):
+        learning_rate = tf.compat.v1.train.piecewise_constant(e, boundaries, values)
+        svdd_optim = tf.keras.optimizers.Adam(learning_rate=learning_rate, amsgrad=True)
         for batch, (source, target) in enumerate(dataset):
             
             with tf.GradientTape() as tape:
@@ -56,10 +63,34 @@ def train_SVDD(autoencoder, optimizer, dataset, c, params, args):
             
             gradients = tape.gradient(dist_loss, autoencoder.trainable_variables)
             gradients, _ = tf.clip_by_global_norm(gradients, params.clip)
-            optimizer.apply_gradients(zip(gradients, autoencoder.trainable_variables))
-            if step % 5 == 0:
-                print("svdd loss: {}, step={}".format(dist_loss, step))
-            step += 1
+            # optimizer.apply_gradients(zip(gradients, autoencoder.trainable_variables))
+            svdd_optim.apply_gradients(zip(gradients, autoencoder.trainable_variables))
+
+            if batch % params.print_every == 0:
+                ckpts.save()
+                logging.info('--- Epoch {}/{} Batch {} ---'.format(e + 1, 40, batch))
+                logging.info('Dist Loss {:.8f}'.format(dist_loss))
+
+def test_SVDD(autoencoder, dataset, c, params, args):
+    logging.info('start testing...')
+    #anomaly score list, the larger the more anomaly
+    scores, labels = [], []
+
+    for batch, (source, target, label) in enumerate(test_dataset):
+        #get batch points output
+        points = autoencoder(source, encode_only=True, noise=False)
+        dist = tf.reduce_sum((points - c) ** 2, 1)
+        scores += np.array(dist).tolist()
+        labels += np.array(label).tolist()
+
+    #test roc_auc with sklearn auc metric
+    labels = np.array(labels)
+    scores = np.array(scores)
+    test_auc = roc_auc_score(labels, scores)
+
+    logging.info('Test set AUC: {:.2f}%'.format(100. * test_auc))
+    logging.info('Finished testing.')
+
 
 
 def train(models, optimizers, dataset, corpus, ckpts, params, args):
@@ -106,8 +137,6 @@ def train(models, optimizers, dataset, corpus, ckpts, params, args):
 
         batch_epoch = 0
 
-def init_center_c(models, dataset, eps=0.1):
-    return
 
 
 if __name__ == '__main__':
@@ -128,6 +157,8 @@ if __name__ == '__main__':
     corpus = Corpus(args.data_dir, n_tokens=args.vocab_size)
     args.vocab_size = min(args.vocab_size, corpus.vocab_size)
     dataset = tf.data.Dataset.from_tensor_slices((corpus.train_source, corpus.train_target)).batch(params.batch_size, drop_remainder=True)
+    test_dataset = tf.data.Dataset.from_tensor_slices((corpus.test_source, corpus.test_target, corpus.test_label)).batch(params.batch_size, drop_remainder=True)
+
 
     # Models
     autoencoder = Seq2Seq(params, args)
@@ -157,6 +188,7 @@ if __name__ == '__main__':
     ###         following are DeepSVDD part
     ######################################################################
 
+    #initialize center c by the mean of the output of latent output
     logging.info('Initializing c ...')
     batch_latent_mean = []
     for batch, (source, target) in enumerate(dataset):
@@ -164,14 +196,21 @@ if __name__ == '__main__':
         batch_latent_mean.append(tf.reduce_mean(real_latent, axis = 0))
     
     c = tf.reduce_mean(tf.cast(batch_latent_mean, tf.float32), axis = 0)
-    svdd_optim = tf.keras.optimizers.Adam(amsgrad = True)
-    
+
+    #set adam optim
+    svdd_optim = tf.keras.optimizers.Adam(amsgrad=True)
     logging.info('Training SVDD...')
 
+    #freeze and discard decoder part of arae
+    autoencoder.decoder_lstm.trainable = False
+    autoencoder.embedding_decoder.trainable = False
+    autoencoder.dense.trainable = False
+
+    #train svdd
     train_SVDD(autoencoder, svdd_optim, dataset, c, params, args)
 
-
-
+    #test, label 0 represent normal, label 1 represent anomaly, compute auc score
+    test_SVDD(autoencoder, test_dataset, c, params, args)
 
 
 
